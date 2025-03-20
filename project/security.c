@@ -1,6 +1,7 @@
 #include "consts.h"
 #include "io.h"
 #include "libsecurity.h"
+#include "debug_utils.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,12 @@ void init_sec(int type, char* host) {
         // Server needs its private key and certificate
         load_private_key("server_key.bin");
         load_certificate("server_cert.bin");
+
+        if (certificate == NULL || cert_size == 0) {
+            fprintf(stderr, "ERROR: Failed to load certificate\n");
+        } else {
+            fprintf(stderr, "Certificate loaded successfully, size: %zu\n", cert_size);
+        }
     } else {
         // Client needs the CA public key for verification
         load_ca_public_key("ca_public_key.bin");
@@ -102,6 +109,7 @@ static uint16_t create_client_hello(uint8_t* buf) {
 // Process a received Client Hello message
 static int process_client_hello(uint8_t* buf, size_t length) {
     tlv* client_hello = deserialize_tlv(buf, length);
+    print_tlv_summary(client_hello, "SERVER RECEIVED CLIENT HELLO:");
     if (client_hello == NULL || client_hello->type != CLIENT_HELLO) {
         if (client_hello != NULL) {
             free_tlv(client_hello);
@@ -140,66 +148,53 @@ static int process_client_hello(uint8_t* buf, size_t length) {
     return 0;
 }
 
-// Creates a Server Hello message and serializes it to the buffer
 static uint16_t create_server_hello(uint8_t* buf) {
-    // Save the server's original private key
     EVP_PKEY* original_key = get_private_key();
     
-    // Create the Server Hello TLV container
     tlv* server_hello = create_tlv(SERVER_HELLO);
     
-    // Generate and add a nonce
     tlv* nonce_tlv = create_tlv(NONCE);
     uint8_t nonce_data[NONCE_SIZE];
     generate_nonce(nonce_data, NONCE_SIZE);
     add_val(nonce_tlv, nonce_data, NONCE_SIZE);
     add_tlv(server_hello, nonce_tlv);
     
-    // Add the server's certificate
     tlv* cert_tlv = deserialize_tlv(certificate, cert_size);
+
     if (cert_tlv == NULL) {
         free_tlv(server_hello);
         return 0;
     }
     add_tlv(server_hello, cert_tlv);
     
-    // Generate an ephemeral key pair for this session
     generate_private_key();
     derive_public_key();
     
-    // Add the ephemeral public key
+
     tlv* pubkey_tlv = create_tlv(PUBLIC_KEY);
     add_val(pubkey_tlv, public_key, pub_key_size);
     add_tlv(server_hello, pubkey_tlv);
     
-    // Create signature data: client_hello + nonce + certificate + pubkey
-    // Use a large buffer to ensure it's big enough (2000 bytes as recommended)
     uint8_t sig_data[2000] = {0};
     uint16_t offset = 0;
     
-    // Copy client hello directly (it's already serialized)
     memcpy(sig_data + offset, client_hello_data, client_hello_size);
     offset += client_hello_size;
     
-    // Serialize each component directly into the signature buffer
     offset += serialize_tlv(sig_data + offset, nonce_tlv);
     offset += serialize_tlv(sig_data + offset, cert_tlv);
     offset += serialize_tlv(sig_data + offset, pubkey_tlv);
     
-    // Switch back to the server's original private key for signing
-    set_private_key(original_key);
+    load_private_key("server_key.bin");
     
-    // Sign the data
     tlv* sig_tlv = create_tlv(HANDSHAKE_SIGNATURE);
-    uint8_t signature[72]; // Max ECDSA signature size
+    uint8_t signature[72];
     size_t sig_size = sign(signature, sig_data, offset);
     add_val(sig_tlv, signature, sig_size);
     add_tlv(server_hello, sig_tlv);
     
-    // Serialize the Server Hello TLV to the buffer
     uint16_t len = serialize_tlv(buf, server_hello);
     
-    // Store a copy of the Server Hello for later use
     if (server_hello_data != NULL) {
         free(server_hello_data);
     }
@@ -209,33 +204,28 @@ static uint16_t create_server_hello(uint8_t* buf) {
         server_hello_size = len;
     }
     
-    // Free the TLV objects
     free_tlv(server_hello);
     
-    // Switch back to the ephemeral key for key derivation
-    EVP_PKEY* ephemeral_key = get_private_key();
-    set_private_key(ephemeral_key);
+    set_private_key(original_key);
     
-    // Derive the shared secret
     derive_secret();
     
-    // Create salt for key derivation: client_hello + server_hello
     uint8_t* salt = (uint8_t*)malloc(client_hello_size + server_hello_size);
     if (salt != NULL) {
         memcpy(salt, client_hello_data, client_hello_size);
         memcpy(salt + client_hello_size, server_hello_data, server_hello_size);
         
-        // Derive the encryption and MAC keys
         derive_keys(salt, client_hello_size + server_hello_size);
         free(salt);
     }
-    
+
     return len;
 }
 
 // Process a received Server Hello message
 static int process_server_hello(uint8_t* buf, size_t length) {
     tlv* server_hello = deserialize_tlv(buf, length);
+    print_tlv_summary(server_hello, "CLIENT RECEIVED SERVER HELLO:");
     if (server_hello == NULL || server_hello->type != SERVER_HELLO) {
         if (server_hello != NULL) {
             free_tlv(server_hello);
