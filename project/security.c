@@ -27,6 +27,16 @@ static uint16_t client_hello_size = 0;
 static uint8_t* server_hello_data = NULL;
 static uint16_t server_hello_size = 0;
 
+// Forward declarations
+static uint16_t create_client_hello(uint8_t* buf);
+static int process_client_hello(uint8_t* buf, size_t length);
+static uint16_t create_server_hello(uint8_t* buf);
+static int process_server_hello(uint8_t* buf, size_t length);
+static uint16_t create_finished(uint8_t* buf);
+static int process_finished(uint8_t* buf, size_t length);
+static uint16_t create_data_message(uint8_t* buf, const uint8_t* data, size_t data_size);
+static int process_data_message(uint8_t* buf, size_t length, uint8_t* output_data, size_t* output_size);
+
 // Creates a Client Hello message and serializes it to the buffer
 static uint16_t create_client_hello(uint8_t* buf) {
     // Create the Client Hello TLV container
@@ -390,10 +400,28 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             current_state = STATE_SERVER_HELLO_SENT;
             return len;
         }
+    } else if (current_state == STATE_SERVER_HELLO_RECEIVED) {
+        if (current_role == CLIENT) {
+            // Client sends Finished message
+            uint16_t len = create_finished(buf);
+            current_state = STATE_FINISHED_SENT;
+            return len;
+        }
+    } else if (current_state == STATE_SECURE) {
+        // We're in secure communication mode, encrypt the data
+        uint8_t plaintext[1024]; // Buffer for plaintext data
+        ssize_t plaintext_len = input_io(plaintext, 943); // Maximum size to prevent block overflow
+        
+        if (plaintext_len <= 0) {
+            return 0; // No data to send
+        }
+        
+        // Encrypt and create data message
+        return create_data_message(buf, plaintext, plaintext_len);
     }
     
-    // For now, just pass through to IO layer for other states
-    return input_io(buf, max_length);
+    // If we reach here, something went wrong
+    return 0;
 }
 
 void output_sec(uint8_t* buf, size_t length) {
@@ -401,6 +429,7 @@ void output_sec(uint8_t* buf, size_t length) {
     if (message == NULL) {
         // Not a valid TLV message, pass through to IO layer
         output_io(buf, length);
+        free_tlv(message);
         return;
     }
     
@@ -409,32 +438,261 @@ void output_sec(uint8_t* buf, size_t length) {
             // Server receiving Client Hello
             if (process_client_hello(buf, length) == 0) {
                 current_state = STATE_CLIENT_HELLO_RECEIVED;
-                free_tlv(message);
-                return;
             }
         } else {
             // Unexpected message
-            free_tlv(message);
             exit(6);
-            return;
         }
     } else if (current_state == STATE_CLIENT_HELLO_SENT && current_role == CLIENT) {
         if (message->type == SERVER_HELLO) {
             // Client receiving Server Hello
             if (process_server_hello(buf, length) == 0) {
                 current_state = STATE_SERVER_HELLO_RECEIVED;
-                free_tlv(message);
-                return;
             }
         } else {
             // Unexpected message
-            free_tlv(message);
             exit(6);
-            return;
+        }
+    } else if (current_state == STATE_SERVER_HELLO_SENT && current_role == SERVER) {
+        if (message->type == FINISHED) {
+            // Server receiving Finished
+            if (process_finished(buf, length) == 0) {
+                current_state = STATE_FINISHED_RECEIVED;
+                current_state = STATE_SECURE; // Ready for secure communication
+            }
+        } else {
+            // Unexpected message
+            exit(6);
+        }
+    } else if (current_state == STATE_FINISHED_SENT && current_role == CLIENT) {
+        if (message->type == DATA) {
+            // Client already sent Finished, process incoming data
+            current_state = STATE_SECURE;
+            // Fall through to process the data
+        } else {
+            // Unexpected message
+            exit(6);
+        }
+    }
+    
+    // Process data messages in secure state
+    if (current_state == STATE_SECURE && message->type == DATA) {
+        uint8_t plaintext[1024];
+        size_t plaintext_len = 0;
+        
+        if (process_data_message(buf, length, plaintext, &plaintext_len) == 0) {
+            // Output decrypted data
+            output_io(plaintext, plaintext_len);
         }
     }
     
     free_tlv(message);
-    // For now, just pass through to IO layer for other states
-    output_io(buf, length);
+}
+
+// Add this to create_finished message function after process_server_hello
+static uint16_t create_finished(uint8_t* buf) {
+    // Create the Finished TLV container
+    tlv* finished = create_tlv(FINISHED);
+    
+    // Calculate transcript (HMAC over client_hello + server_hello)
+    uint8_t* transcript_data = (uint8_t*)malloc(client_hello_size + server_hello_size);
+    if (transcript_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for transcript\n");
+        free_tlv(finished);
+        return 0;
+    }
+    
+    // Concatenate client_hello and server_hello
+    memcpy(transcript_data, client_hello_data, client_hello_size);
+    memcpy(transcript_data + client_hello_size, server_hello_data, server_hello_size);
+    
+    // Create HMAC digest (transcript)
+    tlv* transcript_tlv = create_tlv(TRANSCRIPT);
+    uint8_t digest[MAC_SIZE];
+    hmac(digest, transcript_data, client_hello_size + server_hello_size);
+    add_val(transcript_tlv, digest, MAC_SIZE);
+    add_tlv(finished, transcript_tlv);
+    
+    free(transcript_data);
+    
+    // Serialize the Finished TLV to the buffer
+    uint16_t len = serialize_tlv(buf, finished);
+    
+    // Free the TLV objects
+    free_tlv(finished);
+    
+    return len;
+}
+
+// Add this to process the Finished message
+static int process_finished(uint8_t* buf, size_t length) {
+    tlv* finished = deserialize_tlv(buf, length);
+    if (finished == NULL || finished->type != FINISHED) {
+        if (finished != NULL) {
+            free_tlv(finished);
+        }
+        return -1;
+    }
+    
+    // Extract transcript
+    tlv* transcript_tlv = get_tlv(finished, TRANSCRIPT);
+    if (transcript_tlv == NULL || transcript_tlv->length != MAC_SIZE) {
+        free_tlv(finished);
+        return -1;
+    }
+    
+    // Calculate our own transcript for verification
+    uint8_t* transcript_data = (uint8_t*)malloc(client_hello_size + server_hello_size);
+    if (transcript_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for transcript verification\n");
+        free_tlv(finished);
+        return -1;
+    }
+    
+    // Concatenate client_hello and server_hello
+    memcpy(transcript_data, client_hello_data, client_hello_size);
+    memcpy(transcript_data + client_hello_size, server_hello_data, server_hello_size);
+    
+    // Calculate HMAC digest
+    uint8_t digest[MAC_SIZE];
+    hmac(digest, transcript_data, client_hello_size + server_hello_size);
+    
+    free(transcript_data);
+    
+    // Compare received transcript with calculated one
+    if (memcmp(transcript_tlv->val, digest, MAC_SIZE) != 0) {
+        free_tlv(finished);
+        exit(4); // Bad transcript
+    }
+    
+    free_tlv(finished);
+    return 0;
+}
+
+// Add this to encrypt and create data message
+static uint16_t create_data_message(uint8_t* buf, const uint8_t* data, size_t data_size) {
+    // Create the Data TLV container
+    tlv* data_tlv = create_tlv(DATA);
+    
+    // Generate IV
+    uint8_t iv_data[IV_SIZE];
+    generate_nonce(iv_data, IV_SIZE);
+    tlv* iv_tlv = create_tlv(IV);
+    add_val(iv_tlv, iv_data, IV_SIZE);
+    add_tlv(data_tlv, iv_tlv);
+    
+    // Encrypt the data
+    // Calculate max ciphertext size (rounded to AES block size)
+    size_t max_cipher_size = ((data_size / 16) + 1) * 16;
+    uint8_t* cipher_data = (uint8_t*)malloc(max_cipher_size);
+    if (cipher_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for ciphertext\n");
+        free_tlv(data_tlv);
+        return 0;
+    }
+    
+    size_t cipher_size = encrypt_data(iv_data, cipher_data, data, data_size);
+    
+    // Add ciphertext
+    tlv* cipher_tlv = create_tlv(CIPHERTEXT);
+    add_val(cipher_tlv, cipher_data, cipher_size);
+    add_tlv(data_tlv, cipher_tlv);
+    
+    free(cipher_data);
+    
+    // Serialize IV and ciphertext to calculate MAC
+    uint8_t iv_buf[20]; // Buffer large enough for IV TLV
+    uint16_t iv_serialized_len = serialize_tlv(iv_buf, iv_tlv);
+    
+    uint8_t cipher_buf[1024]; // Buffer for cipher TLV
+    uint16_t cipher_serialized_len = serialize_tlv(cipher_buf, cipher_tlv);
+    
+    // Concatenate IV and ciphertext for MAC calculation
+    uint8_t* mac_data = (uint8_t*)malloc(iv_serialized_len + cipher_serialized_len);
+    if (mac_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for MAC data\n");
+        free_tlv(data_tlv);
+        return 0;
+    }
+    
+    memcpy(mac_data, iv_buf, iv_serialized_len);
+    memcpy(mac_data + iv_serialized_len, cipher_buf, cipher_serialized_len);
+    
+    // Calculate MAC
+    uint8_t mac_digest[MAC_SIZE];
+    hmac(mac_digest, mac_data, iv_serialized_len + cipher_serialized_len);
+    
+    free(mac_data);
+    
+    // Add MAC
+    tlv* mac_tlv = create_tlv(MAC);
+    add_val(mac_tlv, mac_digest, MAC_SIZE);
+    add_tlv(data_tlv, mac_tlv);
+    
+    // Serialize the Data TLV to the buffer
+    uint16_t len = serialize_tlv(buf, data_tlv);
+    
+    // Free the TLV objects
+    free_tlv(data_tlv);
+    
+    return len;
+}
+
+// Add this to process data messages
+static int process_data_message(uint8_t* buf, size_t length, uint8_t* output_data, size_t* output_size) {
+    tlv* data_tlv = deserialize_tlv(buf, length);
+    if (data_tlv == NULL || data_tlv->type != DATA) {
+        if (data_tlv != NULL) {
+            free_tlv(data_tlv);
+        }
+        return -1;
+    }
+    
+    // Extract components
+    tlv* iv_tlv = get_tlv(data_tlv, IV);
+    tlv* cipher_tlv = get_tlv(data_tlv, CIPHERTEXT);
+    tlv* mac_tlv = get_tlv(data_tlv, MAC);
+    
+    if (iv_tlv == NULL || cipher_tlv == NULL || mac_tlv == NULL ||
+        iv_tlv->length != IV_SIZE || mac_tlv->length != MAC_SIZE) {
+        free_tlv(data_tlv);
+        return -1;
+    }
+    
+    // Verify MAC first
+    // Serialize IV and ciphertext to calculate MAC
+    uint8_t iv_buf[20]; // Buffer large enough for IV TLV
+    uint16_t iv_serialized_len = serialize_tlv(iv_buf, iv_tlv);
+    
+    uint8_t cipher_buf[1024]; // Buffer for cipher TLV
+    uint16_t cipher_serialized_len = serialize_tlv(cipher_buf, cipher_tlv);
+    
+    // Concatenate IV and ciphertext for MAC verification
+    uint8_t* mac_data = (uint8_t*)malloc(iv_serialized_len + cipher_serialized_len);
+    if (mac_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for MAC verification\n");
+        free_tlv(data_tlv);
+        return -1;
+    }
+    
+    memcpy(mac_data, iv_buf, iv_serialized_len);
+    memcpy(mac_data + iv_serialized_len, cipher_buf, cipher_serialized_len);
+    
+    // Calculate MAC
+    uint8_t mac_digest[MAC_SIZE];
+    hmac(mac_digest, mac_data, iv_serialized_len + cipher_serialized_len);
+    
+    free(mac_data);
+    
+    // Compare received MAC with calculated one
+    if (memcmp(mac_tlv->val, mac_digest, MAC_SIZE) != 0) {
+        free_tlv(data_tlv);
+        exit(5); // Bad MAC
+    }
+    
+    // Decrypt the data
+    *output_size = decrypt_cipher(output_data, cipher_tlv->val, cipher_tlv->length, iv_tlv->val);
+    
+    free_tlv(data_tlv);
+    return 0;
 }
