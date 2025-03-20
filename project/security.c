@@ -156,12 +156,12 @@ static uint16_t create_server_hello(uint8_t* buf) {
     add_tlv(server_hello, nonce_tlv);
     
     // Add the server's certificate
-    tlv* cert = deserialize_tlv(certificate, cert_size);
-    if (cert == NULL) {
+    tlv* cert_tlv = deserialize_tlv(certificate, cert_size);
+    if (cert_tlv == NULL) {
         free_tlv(server_hello);
         return 0;
     }
-    add_tlv(server_hello, cert);
+    add_tlv(server_hello, cert_tlv);
     
     // Generate an ephemeral key pair for this session
     generate_private_key();
@@ -173,38 +173,18 @@ static uint16_t create_server_hello(uint8_t* buf) {
     add_tlv(server_hello, pubkey_tlv);
     
     // Create signature data: client_hello + nonce + certificate + pubkey
-    uint16_t total_size = client_hello_size;
+    // Use a large buffer to ensure it's big enough (2000 bytes as recommended)
+    uint8_t sig_data[2000] = {0};
+    uint16_t offset = 0;
     
-    // Calculate size needed for serialized components
-    uint8_t nonce_buf[100]; // Buffer for serialized nonce
-    uint16_t nonce_len = serialize_tlv(nonce_buf, nonce_tlv);
-    total_size += nonce_len;
+    // Copy client hello directly (it's already serialized)
+    memcpy(sig_data + offset, client_hello_data, client_hello_size);
+    offset += client_hello_size;
     
-    total_size += cert_size; // Certificate is already serialized
-    
-    uint8_t pubkey_buf[200]; // Buffer for serialized pubkey
-    uint16_t pubkey_len = serialize_tlv(pubkey_buf, pubkey_tlv);
-    total_size += pubkey_len;
-    
-    // Allocate buffer for signature data
-    uint8_t* sig_data = (uint8_t*)malloc(total_size);
-    if (sig_data == NULL) {
-        free_tlv(server_hello);
-        return 0;
-    }
-    
-    // Concatenate data for signature
-    uint8_t* ptr = sig_data;
-    memcpy(ptr, client_hello_data, client_hello_size);
-    ptr += client_hello_size;
-    
-    memcpy(ptr, nonce_buf, nonce_len);
-    ptr += nonce_len;
-    
-    memcpy(ptr, certificate, cert_size);
-    ptr += cert_size;
-    
-    memcpy(ptr, pubkey_buf, pubkey_len);
+    // Serialize each component directly into the signature buffer
+    offset += serialize_tlv(sig_data + offset, nonce_tlv);
+    offset += serialize_tlv(sig_data + offset, cert_tlv);
+    offset += serialize_tlv(sig_data + offset, pubkey_tlv);
     
     // Switch back to the server's original private key for signing
     set_private_key(original_key);
@@ -212,11 +192,9 @@ static uint16_t create_server_hello(uint8_t* buf) {
     // Sign the data
     tlv* sig_tlv = create_tlv(HANDSHAKE_SIGNATURE);
     uint8_t signature[72]; // Max ECDSA signature size
-    size_t sig_size = sign(signature, sig_data, total_size);
+    size_t sig_size = sign(signature, sig_data, offset);
     add_val(sig_tlv, signature, sig_size);
     add_tlv(server_hello, sig_tlv);
-    
-    free(sig_data);
     
     // Serialize the Server Hello TLV to the buffer
     uint16_t len = serialize_tlv(buf, server_hello);
@@ -289,29 +267,19 @@ static int process_server_hello(uint8_t* buf, size_t length) {
     
     // 1. Verify certificate is signed by CA
     // Create data buffer for signature verification: DNS_NAME + PUBLIC_KEY
-    uint16_t dns_buf_size = dns_tlv->length + 2;
-    uint16_t pubkey_buf_size = cert_pubkey_tlv->length + 2;
-    uint8_t* cert_data = (uint8_t*)malloc(dns_buf_size + pubkey_buf_size);
-    if (cert_data == NULL) {
-        free_tlv(server_hello);
-        return -1;
-    }
+    uint8_t cert_data[2000] = {0};
+    uint16_t offset = 0;
     
-    uint8_t* ptr = cert_data;
-    uint16_t dns_len = serialize_tlv(ptr, dns_tlv);
-    ptr += dns_len;
-    
-    uint16_t cert_pubkey_len = serialize_tlv(ptr, cert_pubkey_tlv);
+    // Serialize each component directly into the verification buffer
+    offset += serialize_tlv(cert_data + offset, dns_tlv);
+    offset += serialize_tlv(cert_data + offset, cert_pubkey_tlv);
     
     // Verify with CA's public key
     if (!verify(cert_sig_tlv->val, cert_sig_tlv->length, 
-                cert_data, dns_len + cert_pubkey_len, ec_ca_public_key)) {
-        free(cert_data);
+                cert_data, offset, ec_ca_public_key)) {
         free_tlv(server_hello);
         exit(1); // Bad certificate
     }
-    
-    free(cert_data);
     
     // 2. Verify DNS name matches expected hostname
     char* cert_hostname = (char*)malloc(dns_tlv->length + 1);
@@ -337,43 +305,24 @@ static int process_server_hello(uint8_t* buf, size_t length) {
     // 4. Verify server hello signature
     // Prepare data for signature verification:
     // Client-Hello + Nonce + Certificate + Public-Key
-    uint8_t nonce_buf[100];
-    uint16_t nonce_len = serialize_tlv(nonce_buf, nonce_tlv);
+    uint8_t sig_data[2000] = {0};
+    offset = 0;
     
-    uint8_t cert_buf[1024];
-    uint16_t cert_len = serialize_tlv(cert_buf, cert_tlv);
+    // Copy client hello directly (it's already serialized)
+    memcpy(sig_data + offset, client_hello_data, client_hello_size);
+    offset += client_hello_size;
     
-    uint8_t pubkey_buf[200];
-    uint16_t pubkey_len = serialize_tlv(pubkey_buf, pubkey_tlv);
-    
-    uint16_t sig_data_size = client_hello_size + nonce_len + cert_len + pubkey_len;
-    uint8_t* sig_data = (uint8_t*)malloc(sig_data_size);
-    if (sig_data == NULL) {
-        free_tlv(server_hello);
-        return -1;
-    }
-    
-    ptr = sig_data;
-    memcpy(ptr, client_hello_data, client_hello_size);
-    ptr += client_hello_size;
-    
-    memcpy(ptr, nonce_buf, nonce_len);
-    ptr += nonce_len;
-    
-    memcpy(ptr, cert_buf, cert_len);
-    ptr += cert_len;
-    
-    memcpy(ptr, pubkey_buf, pubkey_len);
+    // Serialize each component directly into the signature buffer
+    offset += serialize_tlv(sig_data + offset, nonce_tlv);
+    offset += serialize_tlv(sig_data + offset, cert_tlv);
+    offset += serialize_tlv(sig_data + offset, pubkey_tlv);
     
     // Verify with server's public key from certificate
     if (!verify(sig_tlv->val, sig_tlv->length, 
-                sig_data, sig_data_size, ec_peer_public_key)) {
-        free(sig_data);
+                sig_data, offset, ec_peer_public_key)) {
         free_tlv(server_hello);
         exit(3); // Bad signature
     }
-    
-    free(sig_data);
     
     // 5. Store the Server Hello for later use
     if (server_hello_data != NULL) {
