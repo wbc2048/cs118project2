@@ -3,7 +3,7 @@ CPPFLAGS=-Wall -Wextra
 LDFLAGS=
 LDLIBS=-ltransport -lsecurity -lcrypto
 
-DEPS=io.o security.o debug_utils.o
+DEPS=io.o security.o
 
 all: server client
 
